@@ -10,11 +10,13 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
+      # 1️⃣ Cloner le dépôt + sous-modules (dont qfield/)
       - name: Checkout (LMCollect + sous-modules)
         uses: actions/checkout@v4
         with:
           submodules: recursive
 
+      # 2️⃣ Définir les variables de version et infos appli
       - name: Définir les versions/app infos
         run: |
           echo "APP_VERSION=$(date +%Y.%m.%d)" >> $GITHUB_ENV
@@ -22,6 +24,7 @@ jobs:
           echo "PKG_ID=com.doumouss29.lmcollect" >> $GITHUB_ENV
           echo "APP_NAME=LM Collect" >> $GITHUB_ENV
 
+      # 3️⃣ Génération des icônes Android
       - name: Générer icônes Android
         run: |
           sudo apt-get update && sudo apt-get install -y imagemagick
@@ -36,6 +39,7 @@ jobs:
               "platform/android/app/src/main/res/$dir/ic_launcher.png"
           done
 
+      # 4️⃣ Splash screen (fond bleu)
       - name: Splash (fond bleu)
         run: |
           mkdir -p platform/android/app/src/main/res/drawable platform/android/app/src/main/res/values
@@ -52,7 +56,7 @@ jobs:
           </resources>
           XML
 
-      # 🟢 Build via le wrapper officiel QField
+      # 5️⃣ Build Android dans le conteneur QField SDK
       - name: Build Android avec QField SDK
         run: |
           set -euo pipefail
@@ -62,8 +66,18 @@ jobs:
             -e APP_VERSION -e APP_VERSION_CODE \
             -e PKG_ID -e APP_NAME \
             opengisch/qfield-sdk:latest \
-            /usr/src/qfield/scripts/docker-build-wrapper.sh
+            bash -lc "
+              echo '== Mise à jour de CMake >= 3.27 =='
+              apt-get update &&
+              apt-get install -y wget &&
+              wget https://github.com/Kitware/CMake/releases/download/v3.27.9/cmake-3.27.9-linux-x86_64.sh &&
+              sh cmake-3.27.9-linux-x86_64.sh --skip-license --prefix=/usr/local &&
+              cmake --version
+              echo '== Lancement du build QField =='
+              /usr/src/qfield/scripts/docker-build-wrapper.sh
+            "
 
+      # 6️⃣ Trouver l’APK produit
       - name: Trouver l’APK produit
         id: apk
         run: |
@@ -71,10 +85,12 @@ jobs:
           echo "apk=$APK" >> "$GITHUB_OUTPUT"
           test -n "$APK" || { echo "Aucun APK trouvé"; exit 1; }
 
+      # 7️⃣ Décoder le keystore (depuis les secrets GitHub)
       - name: Décoder le keystore
         if: ${{ steps.apk.outputs.apk }}
         run: echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > keystore.jks
 
+      # 8️⃣ Signer & aligner l’APK
       - name: Signer & Aligner l’APK
         if: ${{ steps.apk.outputs.apk }}
         run: |
@@ -87,6 +103,7 @@ jobs:
             --key-pass pass:"${{ secrets.ANDROID_KEY_PASSWORD }}" \
             --out lmcollect-signed.apk lmcollect-aligned.apk
 
+      # 9️⃣ Publier l’APK signé comme artefact
       - name: Publier l’APK signé
         uses: actions/upload-artifact@v4
         with:
