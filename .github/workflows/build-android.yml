@@ -6,7 +6,7 @@ on:
     branches: ["rebrand/lm-collect"]
 
 concurrency:
-  group: build-android-${{ github.ref }}-${{ github.sha }}
+  group: build-android-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -57,43 +57,27 @@ jobs:
           </resources>
           XML
 
-      - name: Build Android via QField SDK (Docker, avec CMake récent)
+      # ✅ Lancer le wrapper QField SUR LE RUNNER (pas dans un conteneur)
+      - name: Build Android via QField (wrapper sur l’hôte)
+        env:
+          APP_VERSION: ${{ env.APP_VERSION }}
+          APP_VERSION_CODE: ${{ env.APP_VERSION_CODE }}
+          PKG_ID: ${{ env.PKG_ID }}
+          APP_NAME: ${{ env.APP_NAME }}
         run: |
           set -euo pipefail
-          docker pull opengisch/qfield-sdk:latest
+          # S'assurer que Docker est OK (présent par défaut sur Ubuntu runner)
+          docker version
 
-          # Lancer un shell dans l'image, mettre à jour CMake/Ninja, puis lancer le wrapper
-          docker run --rm -i \
-            -v "$PWD":/usr/src/qfield \
-            -w /usr/src/qfield \
-            -e APP_VERSION -e APP_VERSION_CODE \
-            -e PKG_ID -e APP_NAME \
-            -e ANDROID_SDK_ROOT=/opt/android/sdk \
-            -e ANDROID_HOME=/opt/android/sdk \
-            opengisch/qfield-sdk:latest \
-            bash -lc '
-              set -euo pipefail
-              echo "Avant upgrade:"; cmake --version || true
-              apt-get update
-              # Installer cmake >= 3.19 + ninja (via repo Kitware)
-              apt-get install -y wget gpg lsb-release
-              wget -O - https://apt.kitware.com/keys/kitware-archive-latest.asc | gpg --dearmor -o /usr/share/keyrings/kitware-archive-keyring.gpg
-              echo "deb [signed-by=/usr/share/keyrings/kitware-archive-keyring.gpg] https://apt.kitware.com/ubuntu/ $(. /etc/os-release; echo $VERSION_CODENAME) main" > /etc/apt/sources.list.d/kitware.list
-              apt-get update
-              apt-get install -y cmake ninja-build
-              echo "Après upgrade:"; cmake --version; ninja --version
+          # Rendre le wrapper exécutable et enlever -it (TTY)
+          chmod +x scripts/docker-build-wrapper.sh
+          sed -i 's/-it//g' scripts/docker-build-wrapper.sh
 
-              # Variables Android SDK (évite l’erreur /source.properties)
-              export ANDROID_SDK_ROOT=/opt/android/sdk
-              export ANDROID_HOME=/opt/android/sdk
+          # (Optionnel) pré-puller l’image base utilisée par le wrapper pour accélérer
+          docker pull opengisch/qfield-sdk:latest || true
 
-              # Vérifs rapides
-              test -x scripts/docker-build-wrapper.sh || { echo "❌ scripts/docker-build-wrapper.sh introuvable"; ls -la scripts; exit 1; }
-              echo "Qt dans l’image (indicatif):"; ls -la /opt/qt || true
-
-              # Build QField/Android via le wrapper
-              ./scripts/docker-build-wrapper.sh
-            '
+          echo "➡️ Lancement du wrapper QField (cela va construire/puller l'image qfield_and_dev, installer Qt, puis builder Android)…"
+          ./scripts/docker-build-wrapper.sh
 
       - name: Trouver l’APK produit
         id: apk
@@ -106,7 +90,7 @@ jobs:
           fi
           echo "✅ APK trouvé: $APK"
 
-      - name: Décoder le keystore (skippé si secrets manquants)
+      - name: Décoder le keystore (si présent)
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
         run: |
@@ -117,7 +101,7 @@ jobs:
           echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > keystore.jks
           ls -l keystore.jks || true
 
-      - name: Signer & Aligner l’APK (skippé si secrets manquants)
+      - name: Signer & Aligner l’APK (si tous les secrets sont là)
         env:
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
