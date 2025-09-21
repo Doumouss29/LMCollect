@@ -7,7 +7,7 @@ concurrency:
 on:
   workflow_dispatch:
   push:
-    branches: ["rebrand/lm-collect", "master"]
+    branches: ["rebrand/lm-collect"]
 
 jobs:
   build:
@@ -19,15 +19,7 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Vérifier la présence du sous-module qfield/
-        run: |
-          if [ ! -d "qfield/platform/android" ]; then
-            echo "❌ Le sous-module qfield/ est manquant. As-tu fait: git submodule add -b master https://github.com/opengisch/QField.git qfield ?"
-            exit 1
-          fi
-          echo "✅ qfield/ OK"
-
-      - name: Définir version & infos appli
+      - name: Définir les versions/app infos
         run: |
           echo "APP_VERSION=$(date +%Y.%m.%d)" >> $GITHUB_ENV
           echo "APP_VERSION_CODE=$(( $(date +%s) / 60 ))" >> $GITHUB_ENV
@@ -64,23 +56,7 @@ jobs:
           </resources>
           XML
 
-      # ---------- Cache pour vcpkg (utilisé par le build dans le conteneur) ----------
-      - name: Préparer dossier de cache hôte
-        run: |
-          mkdir -p .ci-cache/vcpkg
-          mkdir -p .ci-cache/downloads
-
-      - name: Cache vcpkg (binaires & downloads)
-        uses: actions/cache@v4
-        with:
-          path: |
-            .ci-cache/vcpkg
-            .ci-cache/downloads
-          key: v1-vcpkg-${{ runner.os }}-${{ hashFiles('qfield/**', 'CMakeLists.txt', 'vcpkg.json', 'vcpkg-configuration.json') }}
-          restore-keys: |
-            v1-vcpkg-${{ runner.os }}-
-
-      # ---------- Build Android dans le conteneur qfield-sdk via CMake/Ninja ----------
+      # --- Build Android via QField SDK avec CMake/Ninja récent ---
       - name: Build Android via QField SDK (CMake/Ninja)
         env:
           APP_VERSION: ${{ env.APP_VERSION }}
@@ -98,7 +74,14 @@ jobs:
             opengisch/qfield-sdk:latest \
             bash -lc '
               set -e
-              apt-get update && apt-get install -y ninja-build
+              # Installer ninja + cmake récent (≥3.19)
+              apt-get update && apt-get install -y ninja-build wget
+              CMAKE_VER=3.27.9
+              wget -q https://github.com/Kitware/CMake/releases/download/v${CMAKE_VER}/cmake-${CMAKE_VER}-linux-x86_64.sh
+              chmod +x cmake-${CMAKE_VER}-linux-x86_64.sh
+              ./cmake-${CMAKE_VER}-linux-x86_64.sh --skip-license --prefix=/usr/local
+              cmake --version
+
               mkdir -p build-arm64-android && cd build-arm64-android
               cmake -G Ninja \
                 -DANDROID=ON \
@@ -118,14 +101,13 @@ jobs:
       - name: Trouver l’APK produit
         id: f
         run: |
-          APK=$(find build-arm64-android -type f -name "*.apk" | head -n1 || true)
+          APK=$(find . -type f -name "*.apk" | head -n1 || true)
           echo "apk=$APK" >> "$GITHUB_OUTPUT"
-          [ -z "$APK" ] && { echo "❌ Aucun APK trouvé"; exit 1; }
-          echo "✅ APK: $APK"
-
-      - name: (Optionnel) Afficher taille APK
-        if: ${{ steps.f.outputs.apk != '' }}
-        run: du -h "${{ steps.f.outputs.apk }}"
+          if [ -z "$APK" ]; then
+            echo "Aucun APK trouvé après le build."; exit 1
+          else
+            echo "APK trouvé: $APK"
+          fi
 
       - name: Décoder le keystore (depuis les secrets)
         if: ${{ steps.f.outputs.apk != '' }}
