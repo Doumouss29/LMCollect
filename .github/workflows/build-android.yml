@@ -1,4 +1,4 @@
-name: Build LM Collect (Android)
+name: Build LM Collect (Androids)
 
 on:
   workflow_dispatch:
