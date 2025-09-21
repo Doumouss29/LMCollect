@@ -14,19 +14,19 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-      - name: Checkout (LMCollect + sous-modules)
+      - name: Checkout (repo + submodules)
         uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: Définir versions / infos app
+      - name: App metadata
         run: |
           echo "APP_VERSION=$(date +%Y.%m.%d)" >> $GITHUB_ENV
           echo "APP_VERSION_CODE=$(( $(date +%s) / 60 ))" >> $GITHUB_ENV
           echo "PKG_ID=com.doumouss29.lmcollect" >> $GITHUB_ENV
           echo "APP_NAME=LM Collect" >> $GITHUB_ENV
 
-      - name: Générer icônes Android
+      - name: Générer icônes
         run: |
           sudo apt-get update && sudo apt-get install -y imagemagick
           mkdir -p platform/android/app/src/main/res
@@ -40,7 +40,7 @@ jobs:
               "platform/android/app/src/main/res/$dir/ic_launcher.png"
           done
 
-      - name: Splash (fond bleu)
+      - name: Splash (fond)
         run: |
           mkdir -p platform/android/app/src/main/res/drawable platform/android/app/src/main/res/values
           cat > platform/android/app/src/main/res/drawable/splash_background.xml <<'XML'
@@ -56,50 +56,40 @@ jobs:
           </resources>
           XML
 
-      - name: Build Android via QField SDK (Qt6 configuré)
-        env:
-          CMAKE_PREFIX_PATH: /opt/qt6/lib/cmake
-          Qt6_DIR: /opt/qt6/lib/cmake/Qt6
+      # 🔧 Préparer et lancer le wrapper QField sur le host (pas dans un conteneur)
+      - name: Build Android (wrapper QField sur host)
         run: |
           set -euo pipefail
-          docker pull opengisch/qfield-sdk:latest
-          docker run --rm \
-            -v "$PWD":/usr/src/qfield \
-            -w /usr/src/qfield \
-            -e APP_VERSION -e APP_VERSION_CODE \
-            -e PKG_ID -e APP_NAME \
-            -e CMAKE_PREFIX_PATH="$CMAKE_PREFIX_PATH" \
-            -e Qt6_DIR="$Qt6_DIR" \
-            opengisch/qfield-sdk:latest \
-            bash -lc '
-              set -euo pipefail
-              if [ -x scripts/docker-build-wrapper.sh ]; then
-                ./scripts/docker-build-wrapper.sh
-              elif [ -x scripts/ci/build-android.sh ]; then
-                ./scripts/ci/build-android.sh
-              else
-                echo "⚠️ Aucun script QField trouvé, tentative CMake directe…"
-                cmake -S qfield -B build-android -G Ninja \
-                  -DANDROID=ON \
-                  -DANDROID_ABI=arm64-v8a \
-                  -DANDROID_PLATFORM=android-35 \
-                  -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
-                  -DQT_HOST_PATH=/opt/qt6 \
-                  -DCMAKE_PREFIX_PATH="$CMAKE_PREFIX_PATH" \
-                  -DQt6_DIR="$Qt6_DIR"
-                cmake --build build-android -j"$(nproc)"
-              fi
-            '
 
-      - name: Trouver l’APK produit
+          # 1) S'assurer que Docker est prêt (présent par défaut sur GitHub runner)
+          docker --version
+
+          # 2) Préparer /io attendu par le wrapper
+          sudo mkdir -p /io
+          sudo chown "$USER":"$USER" /io
+
+          # 3) Virer '-it' du wrapper (évite "the input device is not a TTY")
+          chmod +x scripts/docker-build-wrapper.sh
+          sed -i 's/ -it / /g; s/ -it$/ /g' scripts/docker-build-wrapper.sh
+
+          # 4) Exporter quelques variables utiles (optionnelles)
+          export APP_VERSION="${APP_VERSION}"
+          export APP_VERSION_CODE="${APP_VERSION_CODE}"
+          export PKG_ID="${PKG_ID}"
+          export APP_NAME="${APP_NAME}"
+
+          # 5) Lancer le wrapper (il va pull l'image opengisch/qfield-sdk et builder dedans)
+          ./scripts/docker-build-wrapper.sh
+
+      - name: Trouver l’APK
         id: apk
         run: |
           APK=$(find . -type f -name "*.apk" | head -n1 || true)
           echo "apk=$APK" >> "$GITHUB_OUTPUT"
           test -n "$APK" && echo "✅ APK: $APK" || (echo "❌ Aucun APK trouvé"; exit 1)
 
-      # ======= SIGNATURE (test des secrets dans le script) =======
-      - name: Signer & aligner l’APK (si secrets fournis)
+      # 🔏 Signature : on check les secrets à l'exécution (pas dans if:)
+      - name: Signer & aligner (si secrets présents)
         if: ${{ steps.apk.outputs.apk }}
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
@@ -109,7 +99,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${ANDROID_KEYSTORE_BASE64:-}" ] || [ -z "${ANDROID_KEY_ALIAS:-}" ] || [ -z "${ANDROID_KEYSTORE_PASSWORD:-}" ] || [ -z "${ANDROID_KEY_PASSWORD:-}" ]; then
-            echo "ℹ️ Secrets de signature absents — on publiera l’APK non signé."
+            echo "ℹ️ Secrets absents → on publie l’APK non signé."
             cp "${{ steps.apk.outputs.apk }}" lmcollect-unsigned.apk
             exit 0
           fi
@@ -124,14 +114,14 @@ jobs:
             --key-pass pass:"$ANDROID_KEY_PASSWORD" \
             --out lmcollect-signed.apk lmcollect-aligned.apk
 
-      - name: Publier l’APK signé (si présent)
+      - name: Publier APK signé (si présent)
         if: ${{ hashFiles('lmcollect-signed.apk') != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: lm-collect-apk
           path: lmcollect-signed.apk
 
-      - name: Publier l’APK non signé (fallback)
+      - name: Publier APK non signé (fallback)
         if: ${{ hashFiles('lmcollect-signed.apk') == '' && steps.apk.outputs.apk }}
         uses: actions/upload-artifact@v4
         with:
