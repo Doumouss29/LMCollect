@@ -6,7 +6,7 @@ on:
     branches: ["rebrand/lm-collect"]
 
 concurrency:
-  group: build-android-${{ github.ref }}
+  group: android-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -19,19 +19,19 @@ jobs:
         with:
           submodules: recursive
 
-      - name: App metadata
+      - name: Définir métadonnées appli
         run: |
           echo "APP_VERSION=$(date +%Y.%m.%d)" >> $GITHUB_ENV
           echo "APP_VERSION_CODE=$(( $(date +%s) / 60 ))" >> $GITHUB_ENV
           echo "PKG_ID=com.doumouss29.lmcollect" >> $GITHUB_ENV
           echo "APP_NAME=LM Collect" >> $GITHUB_ENV
 
-      - name: Générer icônes
+      - name: Générer icônes Android depuis JPEG
         run: |
           sudo apt-get update && sudo apt-get install -y imagemagick
           mkdir -p platform/android/app/src/main/res
           for d in mipmap-mdpi mipmap-hdpi mipmap-xhdpi mipmap-xxhdpi mipmap-xxxhdpi; do
-            mkdir -p platform/android/app/src/main/res/$d
+            mkdir -p "platform/android/app/src/main/res/$d"
           done
           declare -A S=( [mipmap-mdpi]=48 [mipmap-hdpi]=72 [mipmap-xhdpi]=96 [mipmap-xxhdpi]=144 [mipmap-xxxhdpi]=192 )
           for dir in "${!S[@]}"; do
@@ -40,7 +40,7 @@ jobs:
               "platform/android/app/src/main/res/$dir/ic_launcher.png"
           done
 
-      - name: Splash (fond)
+      - name: Splash (fond bleu)
         run: |
           mkdir -p platform/android/app/src/main/res/drawable platform/android/app/src/main/res/values
           cat > platform/android/app/src/main/res/drawable/splash_background.xml <<'XML'
@@ -56,41 +56,41 @@ jobs:
           </resources>
           XML
 
-      # 🔧 Préparer et lancer le wrapper QField sur le host (pas dans un conteneur)
+      # --- Nettoyage des warnings chown du runner ---
+      - name: Neutraliser chown (éviter les warnings)
+        run: |
+          mkdir -p .ci-bin
+          printf '%s\n' '#!/usr/bin/env bash' 'command chown "$@" 2>/dev/null || true' > .ci-bin/chown
+          chmod +x .ci-bin/chown
+          echo "$PWD/.ci-bin" >> $GITHUB_PATH
+
+      # --- Build Android via le wrapper QField, exécuté SUR LE RUNNER ---
       - name: Build Android (wrapper QField sur host)
         run: |
           set -euo pipefail
-
-          # 1) S'assurer que Docker est prêt (présent par défaut sur GitHub runner)
           docker --version
-
-          # 2) Préparer /io attendu par le wrapper
-          sudo mkdir -p /io
-          sudo chown "$USER":"$USER" /io
-
-          # 3) Virer '-it' du wrapper (évite "the input device is not a TTY")
+          # Le wrapper s'attend à /io monté : on le prépare côté host
+          sudo mkdir -p /io && sudo chown "$USER":"$USER" /io
+          # S'assurer que le script est exécutable et enlever -it (pas de TTY sur Actions)
           chmod +x scripts/docker-build-wrapper.sh
           sed -i 's/ -it / /g; s/ -it$/ /g' scripts/docker-build-wrapper.sh
-
-          # 4) Exporter quelques variables utiles (optionnelles)
-          export APP_VERSION="${APP_VERSION}"
-          export APP_VERSION_CODE="${APP_VERSION_CODE}"
-          export PKG_ID="${PKG_ID}"
-          export APP_NAME="${APP_NAME}"
-
-          # 5) Lancer le wrapper (il va pull l'image opengisch/qfield-sdk et builder dedans)
+          # Lancer le wrapper (il va lui-même construire son image docker interne puis builder)
           ./scripts/docker-build-wrapper.sh
 
-      - name: Trouver l’APK
+      - name: Trouver l’APK produit
         id: apk
         run: |
-          APK=$(find . -type f -name "*.apk" | head -n1 || true)
+          set -euo pipefail
+          APK="$(find . -type f -name "*.apk" | head -n1 || true)"
           echo "apk=$APK" >> "$GITHUB_OUTPUT"
-          test -n "$APK" && echo "✅ APK: $APK" || (echo "❌ Aucun APK trouvé"; exit 1)
+          if [ -z "$APK" ]; then
+            echo "Aucun APK trouvé"; exit 1
+          fi
+          echo "APK trouvé: $APK"
 
-      # 🔏 Signature : on check les secrets à l'exécution (pas dans if:)
-      - name: Signer & aligner (si secrets présents)
-        if: ${{ steps.apk.outputs.apk }}
+      # Déterminer si tous les secrets de signature sont bien présents
+      - name: Vérifier présence des secrets de signature
+        id: secrets
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
@@ -98,32 +98,37 @@ jobs:
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           set -euo pipefail
-          if [ -z "${ANDROID_KEYSTORE_BASE64:-}" ] || [ -z "${ANDROID_KEY_ALIAS:-}" ] || [ -z "${ANDROID_KEYSTORE_PASSWORD:-}" ] || [ -z "${ANDROID_KEY_PASSWORD:-}" ]; then
-            echo "ℹ️ Secrets absents → on publie l’APK non signé."
-            cp "${{ steps.apk.outputs.apk }}" lmcollect-unsigned.apk
-            exit 0
+          if [ -n "${ANDROID_KEYSTORE_BASE64:-}" ] && \
+             [ -n "${ANDROID_KEY_ALIAS:-}" ] && \
+             [ -n "${ANDROID_KEYSTORE_PASSWORD:-}" ] && \
+             [ -n "${ANDROID_KEY_PASSWORD:-}" ]; then
+            echo "has=true" >> $GITHUB_OUTPUT
+          else
+            echo "has=false" >> $GITHUB_OUTPUT
           fi
 
-          echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > keystore.jks
+      - name: Décoder le keystore
+        if: ${{ steps.apk.outputs.apk != '' && steps.secrets.outputs.has == 'true' }}
+        run: echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > keystore.jks
+
+      - name: Signer & Aligner l’APK (si secrets dispo)
+        if: ${{ steps.apk.outputs.apk != '' && steps.secrets.outputs.has == 'true' }}
+        run: |
+          set -euo pipefail
           sudo apt-get update && sudo apt-get install -y zipalign apksigner
           zipalign -p 4 "${{ steps.apk.outputs.apk }}" lmcollect-aligned.apk
           apksigner sign \
             --ks keystore.jks \
-            --ks-key-alias "$ANDROID_KEY_ALIAS" \
-            --ks-pass pass:"$ANDROID_KEYSTORE_PASSWORD" \
-            --key-pass pass:"$ANDROID_KEY_PASSWORD" \
+            --ks-key-alias "${{ secrets.ANDROID_KEY_ALIAS }}" \
+            --ks-pass pass:"${{ secrets.ANDROID_KEYSTORE_PASSWORD }}" \
+            --key-pass pass:"${{ secrets.ANDROID_KEY_PASSWORD }}" \
             --out lmcollect-signed.apk lmcollect-aligned.apk
 
-      - name: Publier APK signé (si présent)
-        if: ${{ hashFiles('lmcollect-signed.apk') != '' }}
+      - name: Publier l’APK (signé si possible, sinon brut)
         uses: actions/upload-artifact@v4
         with:
           name: lm-collect-apk
-          path: lmcollect-signed.apk
-
-      - name: Publier APK non signé (fallback)
-        if: ${{ hashFiles('lmcollect-signed.apk') == '' && steps.apk.outputs.apk }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: lm-collect-apk-unsigned
-          path: ${{ steps.apk.outputs.apk }}
+          path: |
+            lmcollect-signed.apk
+            ${{ steps.apk.outputs.apk }}
+          if-no-files-found: error
