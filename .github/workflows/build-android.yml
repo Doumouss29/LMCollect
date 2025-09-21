@@ -1,0 +1,111 @@
+name: Build LM Collect (Android)
+
+concurrency:
+  group: build-android-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["rebrand/lm-collect"]
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout (avec sous-modules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Définir version et infos app
+        run: |
+          echo "APP_VERSION=$(date +%Y.%m.%d)" >> $GITHUB_ENV
+          echo "APP_VERSION_CODE=$(( $(date +%s) / 60 ))" >> $GITHUB_ENV
+          echo "PKG_ID=com.doumouss29.lmcollect" >> $GITHUB_ENV
+          echo "APP_NAME=LM Collect" >> $GITHUB_ENV
+
+      - name: Générer icônes Android depuis JPEG (ton logo déjà commité)
+        run: |
+          sudo apt-get update && sudo apt-get install -y imagemagick
+          mkdir -p qfield/platform/android/app/src/main/res
+          for d in mipmap-mdpi mipmap-hdpi mipmap-xhdpi mipmap-xxhdpi mipmap-xxxhdpi; do
+            mkdir -p qfield/platform/android/app/src/main/res/$d
+          done
+          declare -A S=( [mipmap-mdpi]=48 [mipmap-hdpi]=72 [mipmap-xhdpi]=96 [mipmap-xxhdpi]=144 [mipmap-xxxhdpi]=192 )
+          for dir in "${!S[@]}"; do
+            convert "branding/lmcollect/appicon_source.jpeg" \
+              -resize ${S[$dir]}x${S[$dir]}^ -gravity center -extent ${S[$dir]}x${S[$dir]} \
+              "qfield/platform/android/app/src/main/res/$dir/ic_launcher.png"
+          done
+
+      - name: Splash (fond bleu)
+        run: |
+          mkdir -p qfield/platform/android/app/src/main/res/drawable qfield/platform/android/app/src/main/res/values
+          cat > qfield/platform/android/app/src/main/res/drawable/splash_background.xml <<'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+            <item android:drawable="@color/splash_color"/>
+          </layer-list>
+          XML
+          cat > qfield/platform/android/app/src/main/res/values/colors.xml <<'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+            <color name="splash_color">#1E88E5</color>
+          </resources>
+          XML
+
+      # --- Build Android dans le conteneur QField SDK ---
+      - name: Build via QField SDK (Docker)
+        run: |
+          set -euo pipefail
+          docker pull opengisch/qfield-sdk:latest
+          # Monte le repo à /usr/src/qfield et exécute un script de build connu
+          docker run --rm \
+            -v "$PWD/qfield":/usr/src/qfield \
+            -w /usr/src/qfield \
+            -e APP_VERSION -e APP_VERSION_CODE -e PKG_ID -e APP_NAME \
+            opengisch/qfield-sdk:latest \
+            bash -lc '
+              echo "== Contenu scripts =="
+              ls -la scripts || true
+              if [ -f scripts/docker-build.sh ]; then
+                echo "➡️ scripts/docker-build.sh trouvé — exécution"
+                ./scripts/docker-build.sh
+              elif [ -f scripts/ci/build-android.sh ]; then
+                echo "➡️ scripts/ci/build-android.sh trouvé — exécution"
+                ./scripts/ci/build-android.sh
+              else
+                echo "❌ Aucun script de build connu trouvé"; exit 1
+              fi
+            '
+
+      - name: Trouver l’APK produit
+        id: f
+        run: |
+          APK=$(find qfield -type f -name "*.apk" | head -n1 || true)
+          echo "apk=$APK" >> "$GITHUB_OUTPUT"
+          test -n "$APK" && echo "APK trouvé: $APK" || (echo "Aucun APK trouvé"; exit 1)
+
+      - name: Décoder le keystore (depuis les secrets)
+        if: ${{ steps.f.outputs.apk != '' }}
+        run: echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > keystore.jks
+
+      - name: Signer & Aligner l’APK
+        if: ${{ steps.f.outputs.apk != '' }}
+        run: |
+          sudo apt-get update && sudo apt-get install -y apksigner zipalign
+          zipalign -p 4 "${{ steps.f.outputs.apk }}" lmcollect-aligned.apk
+          apksigner sign \
+            --ks keystore.jks \
+            --ks-key-alias "${{ secrets.ANDROID_KEY_ALIAS }}" \
+            --ks-pass pass:"${{ secrets.ANDROID_KEYSTORE_PASSWORD }}" \
+            --key-pass pass:"${{ secrets.ANDROID_KEY_PASSWORD }}" \
+            --out lmcollect-signed.apk lmcollect-aligned.apk
+
+      - name: Publier l’APK signé
+        uses: actions/upload-artifact@v4
+        with:
+          name: lm-collect-apk
+          path: lmcollect-signed.apk
