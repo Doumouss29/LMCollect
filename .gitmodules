@@ -1,0 +1,4 @@
+[submodule "qfield"]
+	path = qfield
+	url = https://github.com/opengisch/QField.git
+	branch = master
