@@ -5,13 +5,15 @@ on:
   push:
     branches: ["rebrand/lm-collect"]
 
+# Évite les annulations surprises : n'annule que les runs du même commit
 concurrency:
-  group: android-${{ github.ref }}
+  group: build-android-${{ github.ref }}-${{ github.sha }}
   cancel-in-progress: true
 
 jobs:
   build:
     runs-on: ubuntu-22.04
+    timeout-minutes: 180
 
     steps:
       - name: Checkout (repo + submodules)
@@ -19,19 +21,19 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Définir métadonnées appli
+      - name: Définir les versions / app infos
         run: |
           echo "APP_VERSION=$(date +%Y.%m.%d)" >> $GITHUB_ENV
           echo "APP_VERSION_CODE=$(( $(date +%s) / 60 ))" >> $GITHUB_ENV
           echo "PKG_ID=com.doumouss29.lmcollect" >> $GITHUB_ENV
           echo "APP_NAME=LM Collect" >> $GITHUB_ENV
 
-      - name: Générer icônes Android depuis JPEG
+      - name: Générer icônes Android
         run: |
           sudo apt-get update && sudo apt-get install -y imagemagick
           mkdir -p platform/android/app/src/main/res
           for d in mipmap-mdpi mipmap-hdpi mipmap-xhdpi mipmap-xxhdpi mipmap-xxxhdpi; do
-            mkdir -p "platform/android/app/src/main/res/$d"
+            mkdir -p platform/android/app/src/main/res/$d
           done
           declare -A S=( [mipmap-mdpi]=48 [mipmap-hdpi]=72 [mipmap-xhdpi]=96 [mipmap-xxhdpi]=144 [mipmap-xxxhdpi]=192 )
           for dir in "${!S[@]}"; do
@@ -56,65 +58,48 @@ jobs:
           </resources>
           XML
 
-      # --- Nettoyage des warnings chown du runner ---
-      - name: Neutraliser chown (éviter les warnings)
-        run: |
-          mkdir -p .ci-bin
-          printf '%s\n' '#!/usr/bin/env bash' 'command chown "$@" 2>/dev/null || true' > .ci-bin/chown
-          chmod +x .ci-bin/chown
-          echo "$PWD/.ci-bin" >> $GITHUB_PATH
-
-      # --- Build Android via le wrapper QField, exécuté SUR LE RUNNER ---
-      - name: Build Android (wrapper QField sur host)
+      - name: Build Android via QField SDK (Docker)
         run: |
           set -euo pipefail
-          docker --version
-          # Le wrapper s'attend à /io monté : on le prépare côté host
-          sudo mkdir -p /io && sudo chown "$USER":"$USER" /io
-          # S'assurer que le script est exécutable et enlever -it (pas de TTY sur Actions)
-          chmod +x scripts/docker-build-wrapper.sh
-          sed -i 's/ -it / /g; s/ -it$/ /g' scripts/docker-build-wrapper.sh
-          # Lancer le wrapper (il va lui-même construire son image docker interne puis builder)
-          ./scripts/docker-build-wrapper.sh
+          echo "Docker:"
+          docker version
+
+          if [ ! -x scripts/docker-build-wrapper.sh ]; then
+            echo "❌ scripts/docker-build-wrapper.sh introuvable ou non exécutable."
+            echo "Contenu du dossier scripts/ :"
+            ls -la scripts || true
+            exit 1
+          fi
+
+          docker pull opengisch/qfield-sdk:latest
+
+          # Pas de TTY (-t) → évite 'the input device is not a TTY'
+          docker run --rm -i \
+            -v "$PWD":/usr/src/qfield \
+            -w /usr/src/qfield \
+            -e APP_VERSION -e APP_VERSION_CODE \
+            -e PKG_ID -e APP_NAME \
+            opengisch/qfield-sdk:latest \
+            bash -lc './scripts/docker-build-wrapper.sh'
 
       - name: Trouver l’APK produit
         id: apk
         run: |
-          set -euo pipefail
-          APK="$(find . -type f -name "*.apk" | head -n1 || true)"
+          APK=$(find . -type f -name "*.apk" | head -n1 || true)
           echo "apk=$APK" >> "$GITHUB_OUTPUT"
           if [ -z "$APK" ]; then
-            echo "Aucun APK trouvé"; exit 1
+            echo "❌ Aucun APK trouvé après le build."
+            exit 1
           fi
-          echo "APK trouvé: $APK"
+          echo "✅ APK trouvé: $APK"
 
-      # Déterminer si tous les secrets de signature sont bien présents
-      - name: Vérifier présence des secrets de signature
-        id: secrets
-        env:
-          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-        run: |
-          set -euo pipefail
-          if [ -n "${ANDROID_KEYSTORE_BASE64:-}" ] && \
-             [ -n "${ANDROID_KEY_ALIAS:-}" ] && \
-             [ -n "${ANDROID_KEYSTORE_PASSWORD:-}" ] && \
-             [ -n "${ANDROID_KEY_PASSWORD:-}" ]; then
-            echo "has=true" >> $GITHUB_OUTPUT
-          else
-            echo "has=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Décoder le keystore
-        if: ${{ steps.apk.outputs.apk != '' && steps.secrets.outputs.has == 'true' }}
+      - name: Décoder le keystore (si secrets présents)
+        if: ${{ steps.apk.outputs.apk != '' && secrets.ANDROID_KEYSTORE_BASE64 != '' }}
         run: echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > keystore.jks
 
-      - name: Signer & Aligner l’APK (si secrets dispo)
-        if: ${{ steps.apk.outputs.apk != '' && steps.secrets.outputs.has == 'true' }}
+      - name: Signer & Aligner l’APK (si secrets complets)
+        if: ${{ steps.apk.outputs.apk != '' && secrets.ANDROID_KEYSTORE_BASE64 != '' && secrets.ANDROID_KEY_ALIAS != '' && secrets.ANDROID_KEYSTORE_PASSWORD != '' && secrets.ANDROID_KEY_PASSWORD != '' }}
         run: |
-          set -euo pipefail
           sudo apt-get update && sudo apt-get install -y zipalign apksigner
           zipalign -p 4 "${{ steps.apk.outputs.apk }}" lmcollect-aligned.apk
           apksigner sign \
@@ -123,8 +108,9 @@ jobs:
             --ks-pass pass:"${{ secrets.ANDROID_KEYSTORE_PASSWORD }}" \
             --key-pass pass:"${{ secrets.ANDROID_KEY_PASSWORD }}" \
             --out lmcollect-signed.apk lmcollect-aligned.apk
+          echo "signed_apk=lmcollect-signed.apk" >> "$GITHUB_OUTPUT"
 
-      - name: Publier l’APK (signé si possible, sinon brut)
+      - name: Publier l’APK signé (ou brut si pas de secrets)
         uses: actions/upload-artifact@v4
         with:
           name: lm-collect-apk
