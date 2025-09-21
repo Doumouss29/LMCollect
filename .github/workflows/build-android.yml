@@ -19,16 +19,18 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Définir version et infos app
+      - name: Définir les versions/app infos
         run: |
           echo "APP_VERSION=$(date +%Y.%m.%d)" >> $GITHUB_ENV
           echo "APP_VERSION_CODE=$(( $(date +%s) / 60 ))" >> $GITHUB_ENV
           echo "PKG_ID=com.doumouss29.lmcollect" >> $GITHUB_ENV
           echo "APP_NAME=LM Collect" >> $GITHUB_ENV
 
-      - name: Générer icônes Android depuis JPEG (ton logo déjà commité)
+      - name: Générer icônes Android depuis JPEG
         run: |
           sudo apt-get update && sudo apt-get install -y imagemagick
+          # Icône source attendue ici (dans ton dépôt app, pas dans le sous-module) :
+          # branding/lmcollect/appicon_source.jpeg
           mkdir -p qfield/platform/android/app/src/main/res
           for d in mipmap-mdpi mipmap-hdpi mipmap-xhdpi mipmap-xxhdpi mipmap-xxxhdpi; do
             mkdir -p qfield/platform/android/app/src/main/res/$d
@@ -56,39 +58,36 @@ jobs:
           </resources>
           XML
 
-      # --- Build Android dans le conteneur QField SDK ---
-      - name: Build via QField SDK (Docker)
+      # IMPORTANT : on lance le build à l'intérieur du sous-module qfield/
+      - name: Build Android via QField SDK (Docker)
         run: |
           set -euo pipefail
           docker pull opengisch/qfield-sdk:latest
-          # Monte le repo à /usr/src/qfield et exécute un script de build connu
           docker run --rm \
-            -v "$PWD/qfield":/usr/src/qfield \
-            -w /usr/src/qfield \
-            -e APP_VERSION -e APP_VERSION_CODE -e PKG_ID -e APP_NAME \
+            -v "$PWD":/work \
+            -w /work/qfield \
+            -e triplet=arm64-android \
+            -e APP_VERSION -e APP_VERSION_CODE \
+            -e PKG_ID -e APP_NAME \
             opengisch/qfield-sdk:latest \
-            bash -lc '
-              echo "== Contenu scripts =="
-              ls -la scripts || true
-              if [ -f scripts/docker-build.sh ]; then
-                echo "➡️ scripts/docker-build.sh trouvé — exécution"
-                ./scripts/docker-build.sh
-              elif [ -f scripts/ci/build-android.sh ]; then
-                echo "➡️ scripts/ci/build-android.sh trouvé — exécution"
-                ./scripts/ci/build-android.sh
-              else
-                echo "❌ Aucun script de build connu trouvé"; exit 1
-              fi
-            '
+            bash -lc './scripts/build.sh'
 
       - name: Trouver l’APK produit
         id: f
         run: |
+          # QField génère l’APK quelque part sous qfield/build/
           APK=$(find qfield -type f -name "*.apk" | head -n1 || true)
           echo "apk=$APK" >> "$GITHUB_OUTPUT"
-          test -n "$APK" && echo "APK trouvé: $APK" || (echo "Aucun APK trouvé"; exit 1)
+          if [ -z "$APK" ]; then
+            echo "Aucun APK trouvé après le build."
+            echo "Contenus du dossier build pour debug :"
+            ls -R qfield/build || true
+            exit 1
+          else
+            echo "APK trouvé: $APK"
+          fi
 
-      - name: Décoder le keystore (depuis les secrets)
+      - name: Décoder le keystore
         if: ${{ steps.f.outputs.apk != '' }}
         run: echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > keystore.jks
 
@@ -96,7 +95,8 @@ jobs:
         if: ${{ steps.f.outputs.apk != '' }}
         run: |
           sudo apt-get update && sudo apt-get install -y apksigner zipalign
-          zipalign -p 4 "${{ steps.f.outputs.apk }}" lmcollect-aligned.apk
+          cp "${{ steps.f.outputs.apk }}" unsigned.apk
+          zipalign -p 4 unsigned.apk lmcollect-aligned.apk
           apksigner sign \
             --ks keystore.jks \
             --ks-key-alias "${{ secrets.ANDROID_KEY_ALIAS }}" \
