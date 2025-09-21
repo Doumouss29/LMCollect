@@ -1,9 +1,5 @@
 name: Build LM Collect (Android)
 
-concurrency:
-  group: build-android-${{ github.ref }}
-  cancel-in-progress: true
-
 on:
   workflow_dispatch:
   push:
@@ -14,7 +10,7 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-      - name: Checkout (avec sous-modules)
+      - name: Checkout (LMCollect + sous-modules)
         uses: actions/checkout@v4
         with:
           submodules: recursive
@@ -26,7 +22,7 @@ jobs:
           echo "PKG_ID=com.doumouss29.lmcollect" >> $GITHUB_ENV
           echo "APP_NAME=LM Collect" >> $GITHUB_ENV
 
-      - name: Générer icônes Android depuis JPEG
+      - name: Générer icônes Android
         run: |
           sudo apt-get update && sudo apt-get install -y imagemagick
           mkdir -p platform/android/app/src/main/res
@@ -56,93 +52,34 @@ jobs:
           </resources>
           XML
 
-      # --- Build Android via QField SDK : détecte Qt6 automatiquement ---
-      - name: Build Android via QField SDK (CMake/Ninja + auto Qt)
-        env:
-          APP_VERSION: ${{ env.APP_VERSION }}
-          APP_VERSION_CODE: ${{ env.APP_VERSION_CODE }}
-          PKG_ID: ${{ env.PKG_ID }}
-          APP_NAME: ${{ env.APP_NAME }}
+      # 🟢 Build via le wrapper officiel QField
+      - name: Build Android avec QField SDK
         run: |
           set -euo pipefail
           docker pull opengisch/qfield-sdk:latest
-          docker run --rm \
+          docker run --rm -i \
             -v "$PWD":/usr/src/qfield \
-            -v "$PWD/.ci-cache/vcpkg":/io/.cache \
-            -v "$PWD/.ci-cache/downloads":/usr/src/qfield/build-arm64-android/_deps/vcpkg-src/downloads \
-            -w /usr/src/qfield \
+            -e APP_VERSION -e APP_VERSION_CODE \
+            -e PKG_ID -e APP_NAME \
             opengisch/qfield-sdk:latest \
-            bash -lc '
-              set -e
-
-              # CMake récent + Ninja
-              apt-get update && apt-get install -y ninja-build wget
-              CMAKE_VER=3.27.9
-              wget -q https://github.com/Kitware/CMake/releases/download/v${CMAKE_VER}/cmake-${CMAKE_VER}-linux-x86_64.sh
-              chmod +x cmake-${CMAKE_VER}-linux-x86_64.sh
-              ./cmake-${CMAKE_VER}-linux-x86_64.sh --skip-license --prefix=/usr/local
-              cmake --version
-              ninja --version || true
-
-              # 🔎 Localiser Qt6 dans l image (android arm64)
-              QT_CMAKE_DIR=$( (find /opt -path "*/android_*/*/lib/cmake/Qt6" -type d 2>/dev/null || true) | head -n1 )
-              if [ -z "$QT_CMAKE_DIR" ]; then
-                # fallback: n importe quel Qt6
-                QT_CMAKE_DIR=$( (find /opt -path "*/lib/cmake/Qt6" -type d 2>/dev/null || true) | head -n1 )
-              fi
-              if [ -z "$QT_CMAKE_DIR" ]; then
-                echo "❌ Qt6 introuvable dans le conteneur."; exit 1
-              fi
-              echo "✅ Qt6 CMake dir: $QT_CMAKE_DIR"
-              export Qt6_DIR="$QT_CMAKE_DIR"
-              # prefix = .../lib/cmake/Qt6 -> remonter de 3 niveaux
-              export CMAKE_PREFIX_PATH="$(dirname "$(dirname "$(dirname "$QT_CMAKE_DIR")")")"
-              echo "CMAKE_PREFIX_PATH=$CMAKE_PREFIX_PATH"
-
-              # (Diagnostics) SDK/NDK si disponibles
-              echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-unset}"
-              echo "ANDROID_NDK_ROOT=${ANDROID_NDK_ROOT:-unset}"
-
-              mkdir -p build-arm64-android
-              cd build-arm64-android
-
-              cmake -G Ninja \
-                -DANDROID=ON \
-                -DANDROID_ABI=arm64-v8a \
-                -DANDROID_PLATFORM=android-35 \
-                -DCMAKE_BUILD_TYPE=Release \
-                -DAPP_VERSION="${APP_VERSION}" \
-                -DAPP_VERSION_CODE="${APP_VERSION_CODE}" \
-                -DPACKAGE_ID="${PKG_ID}" \
-                -DAPP_NAME="${APP_NAME}" \
-                -DCMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH}" \
-                -DQt6_DIR="${Qt6_DIR}" \
-                ..
-              ninja
-              echo "== APKs =="
-              find . -type f -name "*.apk" -print || true
-            '
+            /usr/src/qfield/scripts/docker-build-wrapper.sh
 
       - name: Trouver l’APK produit
-        id: f
+        id: apk
         run: |
           APK=$(find . -type f -name "*.apk" | head -n1 || true)
           echo "apk=$APK" >> "$GITHUB_OUTPUT"
-          if [ -z "$APK" ]; then
-            echo "Aucun APK trouvé après le build."; exit 1
-          else
-            echo "APK trouvé: $APK"
-          fi
+          test -n "$APK" || { echo "Aucun APK trouvé"; exit 1; }
 
-      - name: Décoder le keystore (depuis les secrets)
-        if: ${{ steps.f.outputs.apk != '' }}
+      - name: Décoder le keystore
+        if: ${{ steps.apk.outputs.apk }}
         run: echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > keystore.jks
 
       - name: Signer & Aligner l’APK
-        if: ${{ steps.f.outputs.apk != '' }}
+        if: ${{ steps.apk.outputs.apk }}
         run: |
-          sudo apt-get update && sudo apt-get install -y apksigner zipalign
-          zipalign -p 4 "${{ steps.f.outputs.apk }}" lmcollect-aligned.apk
+          sudo apt-get update && sudo apt-get install -y zipalign apksigner
+          zipalign -p 4 "${{ steps.apk.outputs.apk }}" lmcollect-aligned.apk
           apksigner sign \
             --ks keystore.jks \
             --ks-key-alias "${{ secrets.ANDROID_KEY_ALIAS }}" \
