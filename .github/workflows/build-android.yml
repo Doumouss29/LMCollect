@@ -26,7 +26,7 @@ jobs:
           echo "PKG_ID=com.doumouss29.lmcollect" >> $GITHUB_ENV
           echo "APP_NAME=LM Collect" >> $GITHUB_ENV
 
-      - name: Générer icônes Android (depuis branding/lmcollect/appicon_source.jpeg)
+      - name: Générer icônes Android
         run: |
           sudo apt-get update && sudo apt-get install -y imagemagick
           mkdir -p platform/android/app/src/main/res
@@ -58,24 +58,11 @@ jobs:
 
       - name: Build Android via QField SDK (Qt6 configuré)
         env:
-          # Emplacements Qt6 dans l'image opengisch/qfield-sdk
           CMAKE_PREFIX_PATH: /opt/qt6/lib/cmake
           Qt6_DIR: /opt/qt6/lib/cmake/Qt6
         run: |
           set -euo pipefail
-
-          echo "▶️ Pull image SDK…"
           docker pull opengisch/qfield-sdk:latest
-
-          echo "🔎 Diag Qt6 dans le conteneur:"
-          docker run --rm opengisch/qfield-sdk:latest bash -lc '
-            echo "cmake:"; cmake --version || true
-            echo "ls /opt:"; ls -la /opt || true
-            echo "ls /opt/qt6:"; ls -la /opt/qt6 || true
-            echo "ls /opt/qt6/lib/cmake/Qt6:"; ls -la /opt/qt6/lib/cmake/Qt6 || true
-          '
-
-          echo "🏗️  Build…"
           docker run --rm \
             -v "$PWD":/usr/src/qfield \
             -w /usr/src/qfield \
@@ -86,16 +73,12 @@ jobs:
             opengisch/qfield-sdk:latest \
             bash -lc '
               set -euo pipefail
-              echo "📂 Contenu ./scripts:"; (ls -la scripts || true)
               if [ -x scripts/docker-build-wrapper.sh ]; then
-                echo "➡️ scripts/docker-build-wrapper.sh"
                 ./scripts/docker-build-wrapper.sh
               elif [ -x scripts/ci/build-android.sh ]; then
-                echo "➡️ scripts/ci/build-android.sh"
                 ./scripts/ci/build-android.sh
               else
-                echo "⚠️ Aucun script de build QField trouvé. Tentative CMake directe…"
-                # CMake direct sur le sous-module qfield/ (fallback)
+                echo "⚠️ Aucun script QField trouvé, tentative CMake directe…"
                 cmake -S qfield -B build-android -G Ninja \
                   -DANDROID=ON \
                   -DANDROID_ABI=arm64-v8a \
@@ -115,20 +98,30 @@ jobs:
           echo "apk=$APK" >> "$GITHUB_OUTPUT"
           test -n "$APK" && echo "✅ APK: $APK" || (echo "❌ Aucun APK trouvé"; exit 1)
 
-      - name: Décoder le keystore (depuis les secrets)
+      # ======= SIGNATURE (test des secrets dans le script) =======
+      - name: Signer & aligner l’APK (si secrets fournis)
         if: ${{ steps.apk.outputs.apk }}
-        run: echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > keystore.jks
-
-      - name: Signer & aligner l’APK
-        if: ${{ steps.apk.outputs.apk && secrets.ANDROID_KEYSTORE_BASE64 && secrets.ANDROID_KEY_ALIAS && secrets.ANDROID_KEYSTORE_PASSWORD && secrets.ANDROID_KEY_PASSWORD }}
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
+          set -euo pipefail
+          if [ -z "${ANDROID_KEYSTORE_BASE64:-}" ] || [ -z "${ANDROID_KEY_ALIAS:-}" ] || [ -z "${ANDROID_KEYSTORE_PASSWORD:-}" ] || [ -z "${ANDROID_KEY_PASSWORD:-}" ]; then
+            echo "ℹ️ Secrets de signature absents — on publiera l’APK non signé."
+            cp "${{ steps.apk.outputs.apk }}" lmcollect-unsigned.apk
+            exit 0
+          fi
+
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > keystore.jks
           sudo apt-get update && sudo apt-get install -y zipalign apksigner
           zipalign -p 4 "${{ steps.apk.outputs.apk }}" lmcollect-aligned.apk
           apksigner sign \
             --ks keystore.jks \
-            --ks-key-alias "${{ secrets.ANDROID_KEY_ALIAS }}" \
-            --ks-pass pass:"${{ secrets.ANDROID_KEYSTORE_PASSWORD }}" \
-            --key-pass pass:"${{ secrets.ANDROID_KEY_PASSWORD }}" \
+            --ks-key-alias "$ANDROID_KEY_ALIAS" \
+            --ks-pass pass:"$ANDROID_KEYSTORE_PASSWORD" \
+            --key-pass pass:"$ANDROID_KEY_PASSWORD" \
             --out lmcollect-signed.apk lmcollect-aligned.apk
 
       - name: Publier l’APK signé (si présent)
@@ -139,7 +132,7 @@ jobs:
           path: lmcollect-signed.apk
 
       - name: Publier l’APK non signé (fallback)
-        if: ${{ steps.apk.outputs.apk && hashFiles('lmcollect-signed.apk') == '' }}
+        if: ${{ hashFiles('lmcollect-signed.apk') == '' && steps.apk.outputs.apk }}
         uses: actions/upload-artifact@v4
         with:
           name: lm-collect-apk-unsigned
