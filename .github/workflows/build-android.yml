@@ -7,7 +7,7 @@ concurrency:
 on:
   workflow_dispatch:
   push:
-    branches: ["rebrand/lm-collect"]
+    branches: ["rebrand/lm-collect", "master"]
 
 jobs:
   build:
@@ -19,28 +19,38 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Définir les versions/app infos
+      - name: Vérifier la présence du sous-module qfield/
+        run: |
+          if [ ! -d "qfield/platform/android" ]; then
+            echo "❌ Le sous-module qfield/ est manquant. As-tu fait: git submodule add -b master https://github.com/opengisch/QField.git qfield ?"
+            exit 1
+          fi
+          echo "✅ qfield/ OK"
+
+      - name: Définir version & infos appli
         run: |
           echo "APP_VERSION=$(date +%Y.%m.%d)" >> $GITHUB_ENV
           echo "APP_VERSION_CODE=$(( $(date +%s) / 60 ))" >> $GITHUB_ENV
           echo "PKG_ID=com.doumouss29.lmcollect" >> $GITHUB_ENV
           echo "APP_NAME=LM Collect" >> $GITHUB_ENV
 
-      - name: Générer icônes Android
+      - name: Générer icônes Android depuis JPEG
         run: |
           sudo apt-get update && sudo apt-get install -y imagemagick
           mkdir -p platform/android/app/src/main/res
-          declare -A S=( [mipmap-mdpi]=48 [mipmap-hdpi]=72 [mipmap-xhdpi]=96 [mipmap-xxhdpi]=144 [mipmap-xxxhdpi]=192 )
-          for d in "${!S[@]}"; do
+          for d in mipmap-mdpi mipmap-hdpi mipmap-xhdpi mipmap-xxhdpi mipmap-xxxhdpi; do
             mkdir -p platform/android/app/src/main/res/$d
+          done
+          declare -A S=( [mipmap-mdpi]=48 [mipmap-hdpi]=72 [mipmap-xhdpi]=96 [mipmap-xxhdpi]=144 [mipmap-xxxhdpi]=192 )
+          for dir in "${!S[@]}"; do
             convert "branding/lmcollect/appicon_source.jpeg" \
-              -resize ${S[$d]}x${S[$d]}^ -gravity center -extent ${S[$d]}x${S[$d]} \
-              "platform/android/app/src/main/res/$d/ic_launcher.png"
+              -resize ${S[$dir]}x${S[$dir]}^ -gravity center -extent ${S[$dir]}x${S[$dir]} \
+              "platform/android/app/src/main/res/$dir/ic_launcher.png"
           done
 
       - name: Splash (fond bleu)
         run: |
-          mkdir -p platform/android/app/src/main/res/{drawable,values}
+          mkdir -p platform/android/app/src/main/res/drawable platform/android/app/src/main/res/values
           cat > platform/android/app/src/main/res/drawable/splash_background.xml <<'XML'
           <?xml version="1.0" encoding="utf-8"?>
           <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
@@ -54,47 +64,70 @@ jobs:
           </resources>
           XML
 
-      # ---------- BUILD DOCKER + CACHE ----------
-      - name: Cache Gradle & vcpkg
+      # ---------- Cache pour vcpkg (utilisé par le build dans le conteneur) ----------
+      - name: Préparer dossier de cache hôte
+        run: |
+          mkdir -p .ci-cache/vcpkg
+          mkdir -p .ci-cache/downloads
+
+      - name: Cache vcpkg (binaires & downloads)
         uses: actions/cache@v4
         with:
           path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-            qfield/build-arm64-android/_deps/vcpkg-src
-          key: gradle-vcpkg-${{ runner.os }}-${{ hashFiles('**/build.gradle*','**/CMakeLists.txt') }}
+            .ci-cache/vcpkg
+            .ci-cache/downloads
+          key: v1-vcpkg-${{ runner.os }}-${{ hashFiles('qfield/**', 'CMakeLists.txt', 'vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: |
+            v1-vcpkg-${{ runner.os }}-
 
-      - name: Build Android via QField SDK (avec Ninja)
+      # ---------- Build Android dans le conteneur qfield-sdk via CMake/Ninja ----------
+      - name: Build Android via QField SDK (CMake/Ninja)
+        env:
+          APP_VERSION: ${{ env.APP_VERSION }}
+          APP_VERSION_CODE: ${{ env.APP_VERSION_CODE }}
+          PKG_ID: ${{ env.PKG_ID }}
+          APP_NAME: ${{ env.APP_NAME }}
         run: |
           set -euo pipefail
           docker pull opengisch/qfield-sdk:latest
           docker run --rm \
             -v "$PWD":/usr/src/qfield \
+            -v "$PWD/.ci-cache/vcpkg":/io/.cache \
+            -v "$PWD/.ci-cache/downloads":/usr/src/qfield/build-arm64-android/_deps/vcpkg-src/downloads \
             -w /usr/src/qfield \
-            -e APP_VERSION -e APP_VERSION_CODE \
-            -e PKG_ID -e APP_NAME \
             opengisch/qfield-sdk:latest \
             bash -lc '
+              set -e
               apt-get update && apt-get install -y ninja-build
-              ANDROID_DIR="qfield/platform/android"
-              if [ ! -d "$ANDROID_DIR" ]; then
-                echo "❌ Dossier Android introuvable"; exit 1
-              fi
-              cd "$ANDROID_DIR"
-              chmod +x ./gradlew
-              export CMAKE_GENERATOR=Ninja
-              ./gradlew assembleRelease
+              mkdir -p build-arm64-android && cd build-arm64-android
+              cmake -G Ninja \
+                -DANDROID=ON \
+                -DANDROID_ABI=arm64-v8a \
+                -DANDROID_PLATFORM=android-35 \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DAPP_VERSION="${APP_VERSION}" \
+                -DAPP_VERSION_CODE="${APP_VERSION_CODE}" \
+                -DPACKAGE_ID="${PKG_ID}" \
+                -DAPP_NAME="${APP_NAME}" \
+                ..
+              ninja
+              echo "== APKs =="
+              find . -type f -name "*.apk" -print || true
             '
 
       - name: Trouver l’APK produit
         id: f
         run: |
-          APK=$(find . -type f -name "*.apk" | head -n1 || true)
+          APK=$(find build-arm64-android -type f -name "*.apk" | head -n1 || true)
           echo "apk=$APK" >> "$GITHUB_OUTPUT"
-          [ -z "$APK" ] && { echo "Aucun APK trouvé"; exit 1; }
-          echo "APK trouvé: $APK"
+          [ -z "$APK" ] && { echo "❌ Aucun APK trouvé"; exit 1; }
+          echo "✅ APK: $APK"
 
-      - name: Décoder le keystore
+      - name: (Optionnel) Afficher taille APK
+        if: ${{ steps.f.outputs.apk != '' }}
+        run: du -h "${{ steps.f.outputs.apk }}"
+
+      - name: Décoder le keystore (depuis les secrets)
         if: ${{ steps.f.outputs.apk != '' }}
         run: echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > keystore.jks
 
