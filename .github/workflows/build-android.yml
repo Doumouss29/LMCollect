@@ -1,13 +1,15 @@
 name: Build LM Collect (Android)
 
-concurrency:
-  group: build-android-${{ github.ref }}
-  cancel-in-progress: true
-
 on:
   workflow_dispatch:
   push:
-    branches: ["rebrand/lm-collect"]
+    branches:
+      - master
+      - rebrand/lm-collect
+
+concurrency:
+  group: build-android-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -19,7 +21,12 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Définir les versions/app infos
+      - name: Vérifs du submodule QField
+        run: |
+          test -d qfield/platform/android || { echo "❌ qfield/platform/android manquant"; ls -la; exit 1; }
+          ls -la qfield/platform/android
+
+      - name: Définir version/app infos
         run: |
           echo "APP_VERSION=$(date +%Y.%m.%d)" >> $GITHUB_ENV
           echo "APP_VERSION_CODE=$(( $(date +%s) / 60 ))" >> $GITHUB_ENV
@@ -29,74 +36,76 @@ jobs:
       - name: Générer icônes Android depuis JPEG
         run: |
           sudo apt-get update && sudo apt-get install -y imagemagick
-          # Icône source attendue ici (dans ton dépôt app, pas dans le sous-module) :
-          # branding/lmcollect/appicon_source.jpeg
-          mkdir -p qfield/platform/android/app/src/main/res
+          test -f branding/lmcollect/appicon_source.jpeg || { echo "❌ branding/lmcollect/appicon_source.jpeg introuvable"; exit 1; }
+          mkdir -p platform/android/app/src/main/res
           for d in mipmap-mdpi mipmap-hdpi mipmap-xhdpi mipmap-xxhdpi mipmap-xxxhdpi; do
-            mkdir -p qfield/platform/android/app/src/main/res/$d
+            mkdir -p platform/android/app/src/main/res/$d
           done
-          declare -A S=( [mipmap-mdpi]=48 [mipmap-hdpi]=72 [mipmap-xhdpi]=96 [mipmap-xxhdpi]=144 [mipmap-xxxhdpi]=192 )
+          declare -A S=([mipmap-mdpi]=48 [mipmap-hdpi]=72 [mipmap-xhdpi]=96 [mipmap-xxhdpi]=144 [mipmap-xxxhdpi]=192)
           for dir in "${!S[@]}"; do
             convert "branding/lmcollect/appicon_source.jpeg" \
               -resize ${S[$dir]}x${S[$dir]}^ -gravity center -extent ${S[$dir]}x${S[$dir]} \
-              "qfield/platform/android/app/src/main/res/$dir/ic_launcher.png"
+              "platform/android/app/src/main/res/$dir/ic_launcher.png"
           done
 
       - name: Splash (fond bleu)
         run: |
-          mkdir -p qfield/platform/android/app/src/main/res/drawable qfield/platform/android/app/src/main/res/values
-          cat > qfield/platform/android/app/src/main/res/drawable/splash_background.xml <<'XML'
+          mkdir -p platform/android/app/src/main/res/drawable platform/android/app/src/main/res/values
+          cat > platform/android/app/src/main/res/drawable/splash_background.xml <<'XML'
           <?xml version="1.0" encoding="utf-8"?>
           <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
             <item android:drawable="@color/splash_color"/>
           </layer-list>
           XML
-          cat > qfield/platform/android/app/src/main/res/values/colors.xml <<'XML'
+          cat > platform/android/app/src/main/res/values/colors.xml <<'XML'
           <?xml version="1.0" encoding="utf-8"?>
           <resources>
             <color name="splash_color">#1E88E5</color>
           </resources>
           XML
 
-      # IMPORTANT : on lance le build à l'intérieur du sous-module qfield/
-      - name: Build Android via QField SDK (Docker)
+      - name: Vérifier / installer Docker (si nécessaire)
+        run: |
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "➡️ Docker absent, installation…"
+            sudo apt-get update
+            sudo apt-get install -y docker.io
+          fi
+          docker --version
+          sudo usermod -aG docker $USER || true
+          sudo service docker start || sudo systemctl start docker || true
+          # Test rapide
+          docker ps || true
+
+      - name: Build Android via script QField (dockerisé par le script)
+        working-directory: qfield
+        env:
+          triplet: arm64-android
         run: |
           set -euo pipefail
-          docker pull opengisch/qfield-sdk:latest
-          docker run --rm \
-            -v "$PWD":/work \
-            -w /work/qfield \
-            -e triplet=arm64-android \
-            -e APP_VERSION -e APP_VERSION_CODE \
-            -e PKG_ID -e APP_NAME \
-            opengisch/qfield-sdk:latest \
-            bash -lc './scripts/build.sh'
+          # Le script officiel tire l'image et lance la build pour Android
+          ./scripts/build.sh
 
       - name: Trouver l’APK produit
-        id: f
+        id: findapk
         run: |
-          # QField génère l’APK quelque part sous qfield/build/
-          APK=$(find qfield -type f -name "*.apk" | head -n1 || true)
+          # Chercher APK dans tout le repo
+          APK=$(find . -type f -name "*.apk" -print | head -n1 || true)
           echo "apk=$APK" >> "$GITHUB_OUTPUT"
           if [ -z "$APK" ]; then
-            echo "Aucun APK trouvé après le build."
-            echo "Contenus du dossier build pour debug :"
-            ls -R qfield/build || true
-            exit 1
-          else
-            echo "APK trouvé: $APK"
+            echo "❌ Aucun APK trouvé"; exit 1
           fi
+          echo "✅ APK trouvé: $APK"
 
-      - name: Décoder le keystore
-        if: ${{ steps.f.outputs.apk != '' }}
+      - name: Décoder le keystore (depuis les secrets)
+        if: ${{ steps.findapk.outputs.apk != '' }}
         run: echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > keystore.jks
 
       - name: Signer & Aligner l’APK
-        if: ${{ steps.f.outputs.apk != '' }}
+        if: ${{ steps.findapk.outputs.apk != '' }}
         run: |
           sudo apt-get update && sudo apt-get install -y apksigner zipalign
-          cp "${{ steps.f.outputs.apk }}" unsigned.apk
-          zipalign -p 4 unsigned.apk lmcollect-aligned.apk
+          zipalign -p 4 "${{ steps.findapk.outputs.apk }}" lmcollect-aligned.apk
           apksigner sign \
             --ks keystore.jks \
             --ks-key-alias "${{ secrets.ANDROID_KEY_ALIAS }}" \
@@ -105,6 +114,7 @@ jobs:
             --out lmcollect-signed.apk lmcollect-aligned.apk
 
       - name: Publier l’APK signé
+        if: ${{ steps.findapk.outputs.apk != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: lm-collect-apk
