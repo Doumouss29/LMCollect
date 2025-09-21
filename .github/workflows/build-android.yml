@@ -57,29 +57,43 @@ jobs:
           </resources>
           XML
 
-      - name: Build Android via QField SDK (Docker)
+      - name: Build Android via QField SDK (Docker, avec CMake récent)
         run: |
           set -euo pipefail
-          echo "Docker:"
-          docker version
-
-          if [ ! -x scripts/docker-build-wrapper.sh ]; then
-            echo "❌ scripts/docker-build-wrapper.sh introuvable ou non exécutable."
-            echo "Contenu du dossier scripts/ :"
-            ls -la scripts || true
-            exit 1
-          fi
-
           docker pull opengisch/qfield-sdk:latest
 
-          # Pas de TTY (-t) pour éviter 'the input device is not a TTY'
+          # Lancer un shell dans l'image, mettre à jour CMake/Ninja, puis lancer le wrapper
           docker run --rm -i \
             -v "$PWD":/usr/src/qfield \
             -w /usr/src/qfield \
             -e APP_VERSION -e APP_VERSION_CODE \
             -e PKG_ID -e APP_NAME \
+            -e ANDROID_SDK_ROOT=/opt/android/sdk \
+            -e ANDROID_HOME=/opt/android/sdk \
             opengisch/qfield-sdk:latest \
-            bash -lc './scripts/docker-build-wrapper.sh'
+            bash -lc '
+              set -euo pipefail
+              echo "Avant upgrade:"; cmake --version || true
+              apt-get update
+              # Installer cmake >= 3.19 + ninja (via repo Kitware)
+              apt-get install -y wget gpg lsb-release
+              wget -O - https://apt.kitware.com/keys/kitware-archive-latest.asc | gpg --dearmor -o /usr/share/keyrings/kitware-archive-keyring.gpg
+              echo "deb [signed-by=/usr/share/keyrings/kitware-archive-keyring.gpg] https://apt.kitware.com/ubuntu/ $(. /etc/os-release; echo $VERSION_CODENAME) main" > /etc/apt/sources.list.d/kitware.list
+              apt-get update
+              apt-get install -y cmake ninja-build
+              echo "Après upgrade:"; cmake --version; ninja --version
+
+              # Variables Android SDK (évite l’erreur /source.properties)
+              export ANDROID_SDK_ROOT=/opt/android/sdk
+              export ANDROID_HOME=/opt/android/sdk
+
+              # Vérifs rapides
+              test -x scripts/docker-build-wrapper.sh || { echo "❌ scripts/docker-build-wrapper.sh introuvable"; ls -la scripts; exit 1; }
+              echo "Qt dans l’image (indicatif):"; ls -la /opt/qt || true
+
+              # Build QField/Android via le wrapper
+              ./scripts/docker-build-wrapper.sh
+            '
 
       - name: Trouver l’APK produit
         id: apk
