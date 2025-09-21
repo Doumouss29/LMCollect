@@ -10,13 +10,11 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-      # 1️⃣ Checkout du dépôt + sous-modules
       - name: Checkout (LMCollect + sous-modules)
         uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      # 2️⃣ Variables d’environnement pour la version
       - name: Définir les versions/app infos
         run: |
           echo "APP_VERSION=$(date +%Y.%m.%d)" >> $GITHUB_ENV
@@ -24,7 +22,6 @@ jobs:
           echo "PKG_ID=com.doumouss29.lmcollect" >> $GITHUB_ENV
           echo "APP_NAME=LM Collect" >> $GITHUB_ENV
 
-      # 3️⃣ Génération des icônes Android
       - name: Générer icônes Android
         run: |
           sudo apt-get update && sudo apt-get install -y imagemagick
@@ -39,7 +36,6 @@ jobs:
               "platform/android/app/src/main/res/$dir/ic_launcher.png"
           done
 
-      # 4️⃣ Splash screen
       - name: Splash (fond bleu)
         run: |
           mkdir -p platform/android/app/src/main/res/drawable platform/android/app/src/main/res/values
@@ -56,12 +52,11 @@ jobs:
           </resources>
           XML
 
-      # 5️⃣ Build Android via QField SDK
-      - name: Build Android avec QField SDK (mise à jour CMake ≥3.19)
+      # ✅ Build Android dans le conteneur QField avec CMake 3.27
+      - name: Build Android avec QField SDK (CMake 3.27)
         run: |
           set -euo pipefail
           docker pull opengisch/qfield-sdk:latest
-          # Lancer le conteneur et mettre à jour CMake avant le wrapper
           docker run --rm -i \
             -v "$PWD":/usr/src/qfield \
             -e APP_VERSION -e APP_VERSION_CODE \
@@ -69,11 +64,13 @@ jobs:
             opengisch/qfield-sdk:latest \
             bash -c "
               apt-get update &&
-              apt-get install -y --no-install-recommends cmake ninja-build &&
+              apt-get install -y wget ninja-build &&
+              wget -q https://github.com/Kitware/CMake/releases/download/v3.27.9/cmake-3.27.9-linux-x86_64.sh &&
+              sh cmake-3.27.9-linux-x86_64.sh --skip-license --prefix=/usr/local &&
+              cmake --version &&
               /usr/src/qfield/scripts/docker-build-wrapper.sh
             "
 
-      # 6️⃣ Recherche de l’APK
       - name: Trouver l’APK produit
         id: apk
         run: |
@@ -81,12 +78,10 @@ jobs:
           echo "apk=$APK" >> "$GITHUB_OUTPUT"
           test -n "$APK" || { echo 'Aucun APK trouvé'; exit 1; }
 
-      # 7️⃣ Décodage du keystore
       - name: Décoder le keystore
         if: ${{ steps.apk.outputs.apk }}
         run: echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > keystore.jks
 
-      # 8️⃣ Signature et alignement
       - name: Signer & Aligner l’APK
         if: ${{ steps.apk.outputs.apk }}
         run: |
@@ -99,7 +94,6 @@ jobs:
             --key-pass pass:"${{ secrets.ANDROID_KEY_PASSWORD }}" \
             --out lmcollect-signed.apk lmcollect-aligned.apk
 
-      # 9️⃣ Publication de l’APK signé
       - name: Publier l’APK signé
         uses: actions/upload-artifact@v4
         with:
