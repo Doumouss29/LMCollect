@@ -7,152 +7,111 @@ concurrency:
 on:
   workflow_dispatch:
   push:
-    branches: ["rebrand/lm-collect", "master"]
+    branches: ["rebrand/lm-collect"]
 
 jobs:
   build:
     runs-on: ubuntu-22.04
 
     steps:
-      # --- 1) Checkout avec sous-modules (récupère qfield/) ---
       - name: Checkout (avec sous-modules)
         uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      # --- 2) Métadonnées appli ---
-      - name: Définir version et métadonnées
+      - name: Définir les versions/app infos
         run: |
           echo "APP_VERSION=$(date +%Y.%m.%d)" >> $GITHUB_ENV
           echo "APP_VERSION_CODE=$(( $(date +%s) / 60 ))" >> $GITHUB_ENV
           echo "PKG_ID=com.doumouss29.lmcollect" >> $GITHUB_ENV
           echo "APP_NAME=LM Collect" >> $GITHUB_ENV
-          echo "✅ APP_VERSION=$APP_VERSION / CODE=$APP_VERSION_CODE"
 
-      # --- 3) Icônes (optionnel si le logo est présent) ---
-      - name: Générer icônes Android depuis JPEG (si logo présent)
+      - name: Générer icônes Android
         run: |
-          set -e
-          if [ -f "branding/lmcollect/appicon_source.jpeg" ]; then
-            sudo apt-get update
-            sudo apt-get install -y imagemagick
-            # Dossier des mipmaps dans la structure QField
-            mkdir -p qfield/platform/android/res
-            for d in mipmap-mdpi mipmap-hdpi mipmap-xhdpi mipmap-xxhdpi mipmap-xxxhdpi; do
-              mkdir -p qfield/platform/android/res/$d
-            done
-            declare -A S=( [mipmap-mdpi]=48 [mipmap-hdpi]=72 [mipmap-xhdpi]=96 [mipmap-xxhdpi]=144 [mipmap-xxxhdpi]=192 )
-            for dir in "${!S[@]}"; do
-              convert "branding/lmcollect/appicon_source.jpeg" \
-                -resize ${S[$dir]}x${S[$dir]}^ -gravity center -extent ${S[$dir]}x${S[$dir]} \
-                "qfield/platform/android/res/$dir/ic_launcher.png"
-            done
-            echo "✅ Icônes générées dans qfield/platform/android/res/*"
-          else
-            echo "ℹ️ Pas de logo à branding/lmcollect/appicon_source.jpeg — étape ignorée."
-          fi
+          sudo apt-get update && sudo apt-get install -y imagemagick
+          mkdir -p platform/android/app/src/main/res
+          declare -A S=( [mipmap-mdpi]=48 [mipmap-hdpi]=72 [mipmap-xhdpi]=96 [mipmap-xxhdpi]=144 [mipmap-xxxhdpi]=192 )
+          for d in "${!S[@]}"; do
+            mkdir -p platform/android/app/src/main/res/$d
+            convert "branding/lmcollect/appicon_source.jpeg" \
+              -resize ${S[$d]}x${S[$d]}^ -gravity center -extent ${S[$d]}x${S[$d]} \
+              "platform/android/app/src/main/res/$d/ic_launcher.png"
+          done
 
-      # --- 4) S'assurer que Docker est disponible (runner GitHub) ---
-      - name: Vérifier / installer Docker
+      - name: Splash (fond bleu)
         run: |
-          set -e
-          if ! command -v docker >/dev/null 2>&1; then
-            sudo apt-get update
-            sudo apt-get install -y docker.io
-          fi
-          docker --version
-          # Démarrer le démon Docker si nécessaire
-          sudo service docker start || sudo systemctl start docker || true
-          sleep 3
-          docker ps || true
+          mkdir -p platform/android/app/src/main/res/{drawable,values}
+          cat > platform/android/app/src/main/res/drawable/splash_background.xml <<'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+            <item android:drawable="@color/splash_color"/>
+          </layer-list>
+          XML
+          cat > platform/android/app/src/main/res/values/colors.xml <<'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+            <color name="splash_color">#1E88E5</color>
+          </resources>
+          XML
 
-      # --- 5) Patch des scripts QField pour éviter le TTY (-it) ---
-      - name: Patch scripts QField (enlever -it)
-        working-directory: qfield
-        run: |
-          set -e
-          chmod +x scripts/*.sh || true
-          echo "Avant patch:"
-          grep -Rn "docker run" scripts || true
-          # Remplacer "docker run -it" et "-i -t" par "docker run"
-          sed -i -E 's/docker run\s+-it/docker run/g' scripts/docker-build-wrapper.sh || true
-          sed -i -E 's/docker run\s+-it/docker run/g' scripts/build.sh || true
-          sed -i -E 's/docker run\s+-i\s+-t/docker run/g' scripts/docker-build-wrapper.sh || true
-          sed -i -E 's/docker run\s+-i\s+-t/docker run/g' scripts/build.sh || true
-          echo "Après patch:"
-          grep -Rn "docker run" scripts || true
+      # ---------- BUILD DOCKER + CACHE ----------
+      - name: Cache Gradle & vcpkg
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            qfield/build-arm64-android/_deps/vcpkg-src
+          key: gradle-vcpkg-${{ runner.os }}-${{ hashFiles('**/build.gradle*','**/CMakeLists.txt') }}
 
-      # --- 6) Build Android via scripts QField ---
-      - name: Build Android (scripts QField)
-        working-directory: qfield
-        env:
-          # Le script QField peut lire ces variables dans certaines configs ; sinon sont inoffensives.
-          APP_VERSION: ${{ env.APP_VERSION }}
-          APP_VERSION_CODE: ${{ env.APP_VERSION_CODE }}
-          PKG_ID: ${{ env.PKG_ID }}
-          APP_NAME: ${{ env.APP_NAME }}
-          triplet: arm64-android
+      - name: Build Android via QField SDK (avec Ninja)
         run: |
           set -euo pipefail
-          # Afficher le contenu du dossier scripts pour debug
-          echo "== Contenu scripts =="
-          ls -la scripts || true
-          # Construire
-          ./scripts/build.sh
+          docker pull opengisch/qfield-sdk:latest
+          docker run --rm \
+            -v "$PWD":/usr/src/qfield \
+            -w /usr/src/qfield \
+            -e APP_VERSION -e APP_VERSION_CODE \
+            -e PKG_ID -e APP_NAME \
+            opengisch/qfield-sdk:latest \
+            bash -lc '
+              apt-get update && apt-get install -y ninja-build
+              ANDROID_DIR="qfield/platform/android"
+              if [ ! -d "$ANDROID_DIR" ]; then
+                echo "❌ Dossier Android introuvable"; exit 1
+              fi
+              cd "$ANDROID_DIR"
+              chmod +x ./gradlew
+              export CMAKE_GENERATOR=Ninja
+              ./gradlew assembleRelease
+            '
 
-      # --- 7) Trouver l'APK produite ---
-      - name: Trouver l’APK
-        id: findapk
+      - name: Trouver l’APK produit
+        id: f
         run: |
-          set -e
           APK=$(find . -type f -name "*.apk" | head -n1 || true)
           echo "apk=$APK" >> "$GITHUB_OUTPUT"
-          if [ -z "$APK" ]; then
-            echo "❌ Aucun APK trouvé après le build."
-            # Ne pas exit 1 si tu veux juste voir les logs ; ici on échoue pour être explicite.
-            exit 1
-          else
-            echo "✅ APK trouvée : $APK"
-          fi
+          [ -z "$APK" ] && { echo "Aucun APK trouvé"; exit 1; }
+          echo "APK trouvé: $APK"
 
-      # --- 8) Décoder le keystore SEULEMENT si tous les secrets sont là ---
-      - name: Vérifier secrets & décoder keystore
-        id: have_secrets
-        run: |
-          set -e
-          if [ -n "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" ] && \
-             [ -n "${{ secrets.ANDROID_KEY_ALIAS }}" ] && \
-             [ -n "${{ secrets.ANDROID_KEYSTORE_PASSWORD }}" ] && \
-             [ -n "${{ secrets.ANDROID_KEY_PASSWORD }}" ]; then
-            echo "ok=true" >> $GITHUB_OUTPUT
-            echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > keystore.jks
-            echo "✅ Keystore décodé."
-          else
-            echo "ok=false" >> $GITHUB_OUTPUT
-            echo "⚠️  Secrets absents : on publiera l’APK non signée."
-          fi
+      - name: Décoder le keystore
+        if: ${{ steps.f.outputs.apk != '' }}
+        run: echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > keystore.jks
 
-      # --- 9) Signature (si secrets présents) ---
       - name: Signer & Aligner l’APK
-        if: ${{ steps.findapk.outputs.apk != '' && steps.have_secrets.outputs.ok == 'true' }}
+        if: ${{ steps.f.outputs.apk != '' }}
         run: |
-          set -e
           sudo apt-get update && sudo apt-get install -y apksigner zipalign
-          zipalign -p 4 "${{ steps.findapk.outputs.apk }}" lmcollect-aligned.apk
+          zipalign -p 4 "${{ steps.f.outputs.apk }}" lmcollect-aligned.apk
           apksigner sign \
             --ks keystore.jks \
             --ks-key-alias "${{ secrets.ANDROID_KEY_ALIAS }}" \
             --ks-pass pass:"${{ secrets.ANDROID_KEYSTORE_PASSWORD }}" \
             --key-pass pass:"${{ secrets.ANDROID_KEY_PASSWORD }}" \
             --out lmcollect-signed.apk lmcollect-aligned.apk
-          echo "✅ APK signée : lmcollect-signed.apk"
 
-      # --- 10) Upload des artefacts (APK signée si dispo, sinon APK brute) ---
-      - name: Publier l’APK (signée si possible, sinon brute)
+      - name: Publier l’APK signé
         uses: actions/upload-artifact@v4
         with:
           name: lm-collect-apk
-          path: |
-            lmcollect-signed.apk
-            ${{ steps.findapk.outputs.apk }}
-          if-no-files-found: warn
+          path: lmcollect-signed.apk
